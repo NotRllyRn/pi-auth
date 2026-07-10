@@ -7,9 +7,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { OAuthProviderInterface } from "@earendil-works/pi-ai/compat";
 import { ProfileManager, type PiAdapter } from "./manager.js";
+import { profileUsageRows } from "./usage.js";
 import { Vault } from "./vault.js";
 
 const ALLOWLIST = new Set(["anthropic", "github-copilot", "openai-codex"]);
+const ORIGINAL_PROVIDER = Symbol.for("pi-auth.original-oauth-provider");
+type WrappedProvider = Omit<OAuthProviderInterface, "id"> & {
+	[ORIGINAL_PROVIDER]: OAuthProviderInterface;
+};
+const unwrapProvider = (provider: OAuthProviderInterface) =>
+	(provider as OAuthProviderInterface & Partial<WrappedProvider>)[
+		ORIGINAL_PROVIDER
+	] ?? provider;
 const displayError =
 	"Profile operation failed; saved credentials were not changed";
 
@@ -32,7 +41,9 @@ export default function piAuth(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		selectedModel = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
-		const oauthProviders = ctx.modelRegistry.authStorage.getOAuthProviders();
+		const oauthProviders = ctx.modelRegistry.authStorage
+			.getOAuthProviders()
+			.map(unwrapProvider);
 		const originals = oauthProviders.filter((provider) =>
 			ALLOWLIST.has(provider.id),
 		);
@@ -118,16 +129,21 @@ export default function piAuth(pi: ExtensionAPI) {
 						? "Reconcile"
 						: await ctx.ui.select("Credential Profiles", [
 								"Activate",
+								"Usage",
 								"Rename",
 								"Delete",
 								"Refresh all",
 								"Reconcile",
 							]);
 				if (!action) return;
+				if (action === "Activate") {
+					await activate(manager, ctx);
+					return;
+				}
 				if (action === "Refresh all") {
 					await manager.refreshAll();
 					ctx.ui.notify("Credential Profiles refreshed", "info");
-				} else if (action === "Activate") await activate(manager, ctx);
+				} else if (action === "Usage") await showUsage(manager, ctx);
 				else if (action === "Rename") await rename(manager, ctx);
 				else if (action === "Delete") await remove(manager, ctx);
 				else await reconcile(manager, ctx);
@@ -141,8 +157,9 @@ export default function piAuth(pi: ExtensionAPI) {
 
 function rejectUnsupportedProvider(
 	provider: OAuthProviderInterface,
-): Omit<OAuthProviderInterface, "id"> {
+): WrappedProvider {
 	return {
+		[ORIGINAL_PROVIDER]: provider,
 		name: provider.name,
 		...(provider.usesCallbackServer !== undefined && {
 			usesCallbackServer: provider.usesCallbackServer,
@@ -163,8 +180,9 @@ function rejectUnsupportedProvider(
 function wrapProvider(
 	provider: OAuthProviderInterface,
 	current: () => ProfileManager,
-): Omit<OAuthProviderInterface, "id"> {
+): WrappedProvider {
 	return {
+		[ORIGINAL_PROVIDER]: provider,
 		name: provider.name,
 		...(provider.usesCallbackServer !== undefined && {
 			usesCallbackServer: provider.usesCallbackServer,
@@ -225,6 +243,17 @@ async function chooseProfile(
 	return profile ? { provider, profile, state } : undefined;
 }
 
+async function showUsage(
+	manager: ProfileManager,
+	ctx: ExtensionCommandContext,
+) {
+	await manager.refreshAll(true);
+	const rows = await profileUsageRows(await manager.state());
+	if (rows.length === 0)
+		return ctx.ui.notify("No saved Credential Profiles", "info");
+	await ctx.ui.select("Credential Profile Usage", rows);
+}
+
 async function activate(manager: ProfileManager, ctx: ExtensionCommandContext) {
 	const choice = await chooseProfile(manager, ctx);
 	if (!choice) return;
@@ -246,6 +275,7 @@ async function activate(manager: ProfileManager, ctx: ExtensionCommandContext) {
 		return;
 	await manager.activate(choice.provider, choice.profile, model);
 	ctx.ui.notify(`Activated ${choice.provider}/${choice.profile}`, "info");
+	await ctx.reload();
 }
 
 async function rename(manager: ProfileManager, ctx: ExtensionCommandContext) {

@@ -14,7 +14,8 @@ Restart Pi, then use built-in `/login` or open `/auth-profile`.
 
 ## Commands
 
-- `/auth-profile` — activate, rename, delete, refresh, or reconcile profiles.
+- `/auth-profile` — activate, inspect usage, rename, delete, refresh, or
+  reconcile profiles.
 - `/auth-profile sync` — reconcile a manually changed `auth.json` entry.
 - `/login` — logs in normally and saves the result as a new profile.
 - `/logout` — signs out without deleting saved profiles.
