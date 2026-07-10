@@ -24,14 +24,43 @@ export class Vault {
     return this.withLock(async state => ({ result: await mutate(state), write: true }));
   }
 
+  async transaction<T>(
+    mutate: (state: VaultState) => T | Promise<T>,
+    commit: (result: T) => void | Promise<void>,
+    rollback: (result: T) => void | Promise<void>,
+  ): Promise<T> {
+    await this.acquire();
+    try {
+      const state = await this.load();
+      const original = clone(state);
+      const result = await mutate(state);
+      await this.persist(state);
+      try {
+        await commit(result);
+      } catch (error) {
+        try { await this.persist(original); } finally { await rollback(result); }
+        throw error;
+      }
+      return result;
+    } finally {
+      await rm(this.lockPath, { recursive: true, force: true });
+    }
+  }
+
   async add(provider: string, name: string, credential: OAuthCredential): Promise<CredentialProfile> {
+    return this.change(state => clone(this.insert(state, provider, name, credential)));
+  }
+
+  async addResolved(provider: string, name: string, resolve: () => OAuthCredential): Promise<CredentialProfile> {
+    return this.change(state => clone(this.insert(state, provider, name, resolve())));
+  }
+
+  async addUnique(provider: string, base: string, credential: OAuthCredential): Promise<{ name: string; profile: CredentialProfile }> {
     return this.change(state => {
-      const scoped = state.providers[provider] ??= { profiles: {} };
-      if (scoped.profiles[name]) throw new Error(`Profile "${name}" already exists for ${provider}`);
-      const profile = { id: randomUUID(), credential: clone(credential), generation: 1, status: "ready", retryCount: 0 } as const;
-      scoped.profiles[name] = profile;
-      scoped.defaultProfile = name;
-      return clone(profile);
+      const profiles = state.providers[provider]?.profiles ?? {};
+      let name = base;
+      for (let suffix = 2; profiles[name]; suffix++) name = `${base} ${suffix}`;
+      return { name, profile: clone(this.insert(state, provider, name, credential)) };
     });
   }
 
@@ -57,6 +86,15 @@ export class Vault {
       delete profile.nextRetryAt;
       return true;
     });
+  }
+
+  private insert(state: VaultState, provider: string, name: string, credential: OAuthCredential): CredentialProfile {
+    const scoped = state.providers[provider] ??= { profiles: {} };
+    if (scoped.profiles[name]) throw new Error(`Profile "${name}" already exists for ${provider}`);
+    const profile: CredentialProfile = { id: randomUUID(), credential: clone(credential), generation: 1, status: "ready", retryCount: 0 };
+    scoped.profiles[name] = profile;
+    scoped.defaultProfile = name;
+    return profile;
   }
 
   private findById(state: VaultState, provider: string, id: string): CredentialProfile {

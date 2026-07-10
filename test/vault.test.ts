@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,19 @@ test("serializes concurrent profile changes", async () => {
   const path = join(dir, "vault.json");
   await Promise.all(Array.from({ length: 12 }, (_, index) => new Vault(path).add("anthropic", `Profile ${index}`, credential(String(index)))));
   assert.equal(Object.keys((await new Vault(path).read()).providers.anthropic?.profiles ?? {}).length, 12);
+});
+
+test("serializes changes across processes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-auth-"));
+  const path = join(dir, "vault.json");
+  const worker = join(process.cwd(), "test", "lock-worker.ts");
+  const run = (prefix: string) => new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", worker, path, prefix]);
+    child.once("error", reject);
+    child.once("exit", code => code === 0 ? resolve() : reject(new Error(`lock worker exited ${code}`)));
+  });
+  await Promise.all([run("a"), run("b")]);
+  assert.equal(Object.keys((await new Vault(path).read()).providers.anthropic?.profiles ?? {}).length, 10);
 });
 
 test("recovers malformed data without overwriting it", async () => {

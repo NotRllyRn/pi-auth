@@ -38,34 +38,46 @@ export class ProfileManager {
 
   async capture(provider: string, credentials: OAuthCredentials, requestedName?: string): Promise<string> {
     this.requireProvider(provider);
-    const state = await this.state();
-    const scoped = state.providers[provider];
-    const base = requestedName?.trim() || "Profile";
-    const name = requestedName?.trim() ? this.validateName(base) : this.uniqueName(scoped?.profiles ?? {}, base);
-    await this.vault.add(provider, name, oauth(credentials));
-    return name;
+    const requested = requestedName?.trim();
+    if (requested) {
+      await this.vault.add(provider, this.validateName(requested), oauth(credentials));
+      return requested;
+    }
+    return (await this.vault.addUnique(provider, "Profile", oauth(credentials))).name;
+  }
+
+  async finalizeLogin(provider: string, name: string, credentials: OAuthCredentials): Promise<void> {
+    const credential = oauth(credentials);
+    await this.vault.change(state => {
+      const scoped = state.providers[provider];
+      if (scoped?.profiles[name] && sameCredential(this.pi.getCredential(provider), credential)) scoped.defaultProfile = name;
+    });
   }
 
   async activate(provider: string, name: string, model: string): Promise<void> {
     this.requireProvider(provider);
     if (!this.pi.models(provider).includes(model)) throw new Error("Selected model is not compatible with this provider");
-    let beforeCredential: OAuthCredential | undefined;
-    let beforeModel: string | undefined;
     try {
-      await this.vault.change(async state => {
-        beforeCredential = this.pi.getCredential(provider);
-        beforeModel = this.pi.getModel();
-        const scoped = state.providers[provider];
-        const profile = scoped?.profiles[name];
-        if (!profile) throw new Error("Profile not found");
-        this.pi.setCredential(provider, profile.credential);
-        if (!await this.pi.setModel(model)) throw new Error("model selection failed");
-        scoped.defaultProfile = name;
-        scoped.model = model;
-      });
+      await this.vault.transaction(
+        state => {
+          const scoped = state.providers[provider];
+          const profile = scoped?.profiles[name];
+          if (!profile) throw new Error("Profile not found");
+          const result = { beforeCredential: this.pi.getCredential(provider), beforeModel: this.pi.getModel(), credential: profile.credential };
+          scoped.defaultProfile = name;
+          scoped.model = model;
+          return result;
+        },
+        async result => {
+          this.pi.setCredential(provider, result.credential);
+          if (!await this.pi.setModel(model)) throw new Error("model selection failed");
+        },
+        async result => {
+          result.beforeCredential ? this.pi.setCredential(provider, result.beforeCredential) : this.pi.removeCredential(provider);
+          if (result.beforeModel) await this.pi.setModel(result.beforeModel);
+        },
+      );
     } catch {
-      beforeCredential ? this.pi.setCredential(provider, beforeCredential) : this.pi.removeCredential(provider);
-      if (beforeModel) await this.pi.setModel(beforeModel);
       throw new Error("Activation failed; the previous selection was restored");
     }
   }
@@ -84,56 +96,79 @@ export class ProfileManager {
   }
 
   async delete(provider: string, name: string): Promise<"deleted" | "switched" | "detached"> {
-    let beforeCredential: OAuthCredential | undefined;
-    let beforeModel: string | undefined;
-    let result: "deleted" | "switched" | "detached" = "deleted";
     try {
-      await this.vault.change(async state => {
-        beforeCredential = this.pi.getCredential(provider);
-        beforeModel = this.pi.getModel();
-        const scoped = state.providers[provider];
-        const profile = scoped?.profiles[name];
-        if (!profile) throw new Error("Profile not found");
-        const active = sameCredential(this.pi.getCredential(provider), profile.credential);
-        const replacement = Object.keys(scoped.profiles).find(candidate => candidate !== name);
-        if (active && replacement) {
-          const model = scoped.model && this.pi.models(provider).includes(scoped.model) ? scoped.model : this.pi.models(provider)[0];
-          if (!model) throw new Error("No compatible model is available");
-          const nextProfile = scoped.profiles[replacement];
-          if (!nextProfile) throw new Error("Replacement profile not found");
-          this.pi.setCredential(provider, nextProfile.credential);
-          if (!await this.pi.setModel(model)) throw new Error("model selection failed");
-          scoped.defaultProfile = replacement;
-          result = "switched";
-        } else if (active) {
-          this.pi.removeCredential(provider);
-          result = "detached";
-        }
-        delete scoped.profiles[name];
-        if (!Object.keys(scoped.profiles).length) delete state.providers[provider];
-      });
-      return result;
+      const outcome = await this.vault.transaction(
+        state => {
+          const scoped = state.providers[provider];
+          const profile = scoped?.profiles[name];
+          if (!profile) throw new Error("Profile not found");
+          const beforeCredential = this.pi.getCredential(provider);
+          const beforeModel = this.pi.getModel();
+          const active = sameCredential(beforeCredential, profile.credential);
+          const replacement = Object.keys(scoped.profiles).find(candidate => candidate !== name);
+          let result: "deleted" | "switched" | "detached" = "deleted";
+          let credential: OAuthCredential | undefined;
+          let model: string | undefined;
+          if (active && replacement) {
+            model = scoped.model && this.pi.models(provider).includes(scoped.model) ? scoped.model : this.pi.models(provider)[0];
+            credential = scoped.profiles[replacement]?.credential;
+            if (!model || !credential) throw new Error("No compatible replacement is available");
+            scoped.defaultProfile = replacement;
+            result = "switched";
+          } else if (active) result = "detached";
+          delete scoped.profiles[name];
+          if (!Object.keys(scoped.profiles).length) delete state.providers[provider];
+          return { result, credential, model, beforeCredential, beforeModel };
+        },
+        async value => {
+          if (value.result === "switched") {
+            if (!value.credential || !value.model) throw new Error("Replacement profile is incomplete");
+            this.pi.setCredential(provider, value.credential);
+            if (!await this.pi.setModel(value.model)) throw new Error("model selection failed");
+          } else if (value.result === "detached") this.pi.removeCredential(provider);
+        },
+        async value => {
+          value.beforeCredential ? this.pi.setCredential(provider, value.beforeCredential) : this.pi.removeCredential(provider);
+          if (value.beforeModel) await this.pi.setModel(value.beforeModel);
+        },
+      );
+      return outcome.result;
     } catch {
-      beforeCredential ? this.pi.setCredential(provider, beforeCredential) : this.pi.removeCredential(provider);
-      if (beforeModel) await this.pi.setModel(beforeModel);
       throw new Error("Deletion failed; the previous selection was restored");
     }
   }
 
   async reconcile(provider: string, action: "update" | "create" | "restore", name?: string): Promise<void> {
-    const mirror = this.pi.getCredential(provider);
-    const state = await this.state();
-    const scoped = state.providers[provider];
-    const selected = scoped?.defaultProfile && scoped.profiles[scoped.defaultProfile];
     if (action === "restore") {
-      if (!selected) throw new Error("No Provider Default to restore");
-      this.pi.setCredential(provider, selected.credential);
+      await this.vault.transaction(
+        state => {
+          const scoped = state.providers[provider];
+          const selected = scoped?.defaultProfile && scoped.profiles[scoped.defaultProfile];
+          if (!selected) throw new Error("No Provider Default to restore");
+          return { beforeCredential: this.pi.getCredential(provider), credential: selected.credential };
+        },
+        result => this.pi.setCredential(provider, result.credential),
+        result => result.beforeCredential ? this.pi.setCredential(provider, result.beforeCredential) : this.pi.removeCredential(provider),
+      );
     } else if (action === "update") {
-      if (!mirror || !selected) throw new Error("A mirror and Provider Default are required");
-      await this.vault.updateCredential(provider, selected.id, mirror);
+      await this.vault.change(state => {
+        const scoped = state.providers[provider];
+        const selected = scoped?.defaultProfile && scoped.profiles[scoped.defaultProfile];
+        const mirror = this.pi.getCredential(provider);
+        if (!mirror || !selected) throw new Error("A mirror and Provider Default are required");
+        selected.credential = structuredClone(mirror);
+        selected.generation++;
+        selected.status = "ready";
+        selected.retryCount = 0;
+        delete selected.nextRetryAt;
+      });
     } else {
-      if (!mirror) throw new Error("No OAuth mirror to save");
-      await this.capture(provider, mirror, name);
+      const requested = this.validateName(name?.trim() ?? "");
+      await this.vault.addResolved(provider, requested, () => {
+        const mirror = this.pi.getCredential(provider);
+        if (!mirror) throw new Error("No OAuth mirror to save");
+        return mirror;
+      });
     }
   }
 
@@ -161,8 +196,29 @@ export class ProfileManager {
   private async refresh(provider: OAuthProviderInterface, profile: CredentialProfile): Promise<void> {
     try {
       const refreshed = oauth(await provider.refreshToken(profile.credential));
-      const committed = await this.vault.commitRefresh(provider.id, profile.id, profile.generation, refreshed);
-      if (committed && sameCredential(this.pi.getCredential(provider.id), profile.credential)) this.pi.setCredential(provider.id, refreshed);
+      await this.vault.transaction(
+        state => {
+          const current = Object.values(state.providers[provider.id]?.profiles ?? {}).find(value => value.id === profile.id);
+          if (!current || current.generation !== profile.generation) return { committed: false } as const;
+          const beforeCredential = this.pi.getCredential(provider.id);
+          const active = sameCredential(beforeCredential, current.credential);
+          current.credential = refreshed;
+          current.generation++;
+          current.status = "ready";
+          current.retryCount = 0;
+          delete current.nextRetryAt;
+          return { committed: true, active, beforeCredential } as const;
+        },
+        result => {
+          if (result.committed && result.active && sameCredential(this.pi.getCredential(provider.id), result.beforeCredential)) {
+            this.pi.setCredential(provider.id, refreshed);
+          }
+        },
+        result => {
+          if (!result.committed || !result.active) return;
+          result.beforeCredential ? this.pi.setCredential(provider.id, result.beforeCredential) : this.pi.removeCredential(provider.id);
+        },
+      );
     } catch (error) {
       await this.vault.change(state => {
         const current = Object.values(state.providers[provider.id]?.profiles ?? {}).find(value => value.id === profile.id);
@@ -186,8 +242,4 @@ export class ProfileManager {
     return name;
   }
 
-  private uniqueName(profiles: Record<string, unknown>, base: string): string {
-    if (!profiles[base]) return base;
-    for (let suffix = 2; ; suffix++) if (!profiles[`${base} ${suffix}`]) return `${base} ${suffix}`;
-  }
 }

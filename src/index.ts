@@ -110,11 +110,15 @@ function wrapProvider(provider: OAuthProviderInterface, current: () => ProfileMa
     ...(provider.modifyModels && { modifyModels: provider.modifyModels.bind(provider) }),
     login: async callbacks => {
       const credential = await provider.login(callbacks);
-      const generated = await current().capture(provider.id, credential);
+      let name = await current().capture(provider.id, credential);
       try {
-        const requested = (await callbacks.onPrompt({ message: `Name saved ${provider.name} profile`, placeholder: generated })).trim();
-        if (requested && requested !== generated) await current().rename(provider.id, generated, requested);
+        const requested = (await callbacks.onPrompt({ message: `Name saved ${provider.name} profile`, placeholder: name })).trim();
+        if (requested && requested !== name) {
+          await current().rename(provider.id, name, requested);
+          name = requested;
+        }
       } catch { /* Cancellation keeps the generated name and successful login. */ }
+      setTimeout(() => void current().finalizeLogin(provider.id, name, credential).catch(() => {}), 0);
       return credential;
     },
   };

@@ -53,10 +53,12 @@ test("failed activation restores the prior mirror and model", async () => {
   const env = await manager();
   env.mirror.set("anthropic", { type: "oauth", ...credential("prior") });
   await env.manager.capture("anthropic", credential("saved"), "Work");
+  await env.manager.capture("anthropic", credential("stable"), "Stable");
   env.runtime.failModel = true;
   await assert.rejects(env.manager.activate("anthropic", "Work", "anthropic/new"), /previous selection was restored/);
   assert.equal(env.mirror.get("anthropic")?.access, "prior");
   assert.equal(env.runtime.model, "anthropic/old");
+  assert.equal((await env.manager.state()).providers.anthropic?.defaultProfile, "Stable");
 });
 
 test("rename, deletion, and reconciliation preserve explicit outcomes", async () => {
@@ -74,6 +76,27 @@ test("rename, deletion, and reconciliation preserve explicit outcomes", async ()
   env.mirror.set("anthropic", { type: "oauth", ...credential("changed") });
   await env.manager.reconcile("anthropic", "restore");
   assert.equal(env.mirror.get("anthropic")?.access, "new");
+});
+
+test("concurrent logins receive distinct generated names", async () => {
+  const env = await manager();
+  assert.deepEqual(
+    (await Promise.all([
+      env.manager.capture("anthropic", credential("one")),
+      env.manager.capture("anthropic", credential("two")),
+    ])).sort(),
+    ["Profile", "Profile 2"],
+  );
+});
+
+test("login finalization follows the last Canonical Mirror write", async () => {
+  const env = await manager();
+  const login = credential("login");
+  await env.manager.capture("anthropic", login, "Login");
+  await env.manager.capture("anthropic", credential("other"), "Other");
+  env.mirror.set("anthropic", { type: "oauth", ...login });
+  await env.manager.finalizeLogin("anthropic", "Login", login);
+  assert.equal((await env.manager.state()).providers.anthropic?.defaultProfile, "Login");
 });
 
 test("delete and Activation are serialized across managers", async () => {
@@ -115,6 +138,26 @@ test("rejects a stale refresh result", async () => {
   resolveRefresh(credential("stale"));
   await refreshing;
   assert.equal((await env.manager.state()).providers.anthropic?.profiles.Work?.credential.access, "new");
+});
+
+test("inactive refresh cannot overwrite a concurrent Activation", async () => {
+  const env = await manager();
+  await env.manager.capture("anthropic", credential("work", 0), "Work");
+  await env.manager.capture("anthropic", credential("other"), "Other");
+  await env.manager.activate("anthropic", "Work", "anthropic/new");
+  let resolveRefresh!: (value: OAuthCredentials) => void;
+  let started!: () => void;
+  const refreshStarted = new Promise<void>(resolve => { started = resolve; });
+  env.provider.refreshToken = async value => value.access === "work"
+    ? new Promise(resolve => { resolveRefresh = resolve; started(); })
+    : value;
+  const refreshing = env.manager.refreshAll();
+  await refreshStarted;
+  await env.manager.activate("anthropic", "Other", "anthropic/new");
+  resolveRefresh(credential("work-fresh"));
+  await refreshing;
+  assert.equal(env.mirror.get("anthropic")?.access, "other");
+  assert.equal((await env.manager.state()).providers.anthropic?.profiles.Work?.credential.access, "work-fresh");
 });
 
 test("refresh retains rotation and marks permanent failures without deletion", async () => {
