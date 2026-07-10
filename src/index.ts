@@ -21,7 +21,8 @@ export default function piAuth(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     selectedModel = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
-    const originals = ctx.modelRegistry.authStorage.getOAuthProviders().filter(provider => ALLOWLIST.has(provider.id));
+    const oauthProviders = ctx.modelRegistry.authStorage.getOAuthProviders();
+    const originals = oauthProviders.filter(provider => ALLOWLIST.has(provider.id));
     const providers = new Map(originals.map(provider => [provider.id, provider]));
     const adapter: PiAdapter = {
       getCredential: provider => {
@@ -46,6 +47,9 @@ export default function piAuth(pi: ExtensionAPI) {
       if (!manager) throw new Error("Profile manager is not ready");
       return manager;
     }) });
+    for (const provider of oauthProviders.filter(value => !ALLOWLIST.has(value.id))) {
+      pi.registerProvider(provider.id, { oauth: rejectUnsupportedProvider(provider) });
+    }
     await manager.bootstrap();
     await updateStatus(ctx);
     statusTimer = setInterval(() => void updateStatus(ctx), 2_000);
@@ -86,6 +90,17 @@ export default function piAuth(pi: ExtensionAPI) {
   });
 }
 
+function rejectUnsupportedProvider(provider: OAuthProviderInterface): Omit<OAuthProviderInterface, "id"> {
+  return {
+    name: provider.name,
+    ...(provider.usesCallbackServer !== undefined && { usesCallbackServer: provider.usesCallbackServer }),
+    refreshToken: credential => provider.refreshToken(credential),
+    getApiKey: credential => provider.getApiKey(credential),
+    ...(provider.modifyModels && { modifyModels: provider.modifyModels.bind(provider) }),
+    login: async () => { throw new Error(`pi-auth does not support OAuth login for ${provider.id}`); },
+  };
+}
+
 function wrapProvider(provider: OAuthProviderInterface, current: () => ProfileManager): Omit<OAuthProviderInterface, "id"> {
   return {
     name: provider.name,
@@ -111,7 +126,10 @@ async function chooseProfile(manager: ProfileManager, ctx: ExtensionCommandConte
   if (!provider) return;
   const scoped = state.providers[provider];
   if (!scoped) return;
-  const profile = await ctx.ui.select("Credential Profile", Object.keys(scoped.profiles));
+  const profiles = Object.entries(scoped.profiles);
+  const labels = profiles.map(([name, profile]) => `${name}${scoped.defaultProfile === name ? " · default" : ""}${profile.status === "ready" ? "" : ` · ${profile.status === "needs-login" ? "Needs Login" : "retrying"}`}`);
+  const selected = await ctx.ui.select("Credential Profile", labels);
+  const profile = selected && profiles[labels.indexOf(selected)]?.[0];
   return profile ? { provider, profile, state } : undefined;
 }
 

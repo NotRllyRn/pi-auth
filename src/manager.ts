@@ -49,10 +49,12 @@ export class ProfileManager {
   async activate(provider: string, name: string, model: string): Promise<void> {
     this.requireProvider(provider);
     if (!this.pi.models(provider).includes(model)) throw new Error("Selected model is not compatible with this provider");
-    const beforeCredential = this.pi.getCredential(provider);
-    const beforeModel = this.pi.getModel();
+    let beforeCredential: OAuthCredential | undefined;
+    let beforeModel: string | undefined;
     try {
       await this.vault.change(async state => {
+        beforeCredential = this.pi.getCredential(provider);
+        beforeModel = this.pi.getModel();
         const scoped = state.providers[provider];
         const profile = scoped?.profiles[name];
         if (!profile) throw new Error("Profile not found");
@@ -82,29 +84,40 @@ export class ProfileManager {
   }
 
   async delete(provider: string, name: string): Promise<"deleted" | "switched" | "detached"> {
-    const state = await this.state();
-    const scoped = state.providers[provider];
-    const profile = scoped?.profiles[name];
-    if (!profile) throw new Error("Profile not found");
-    const active = sameCredential(this.pi.getCredential(provider), profile.credential);
-    const replacement = Object.keys(scoped.profiles).find(candidate => candidate !== name);
-    if (active && replacement) {
-      const model = scoped.model && this.pi.models(provider).includes(scoped.model) ? scoped.model : this.pi.models(provider)[0];
-      if (!model) throw new Error("No compatible model is available");
-      await this.activate(provider, replacement, model);
-    } else if (active) this.pi.removeCredential(provider);
-    await this.vault.change(next => {
-      const nextScoped = next.providers[provider];
-      if (!nextScoped?.profiles[name]) throw new Error("Profile changed during deletion");
-      delete nextScoped.profiles[name];
-      if (nextScoped.defaultProfile === name) {
-        if (replacement) nextScoped.defaultProfile = replacement;
-        else delete nextScoped.defaultProfile;
-      }
-      if (!Object.keys(nextScoped.profiles).length) delete next.providers[provider];
-    });
-    if (!active) return "deleted";
-    return replacement ? "switched" : "detached";
+    let beforeCredential: OAuthCredential | undefined;
+    let beforeModel: string | undefined;
+    let result: "deleted" | "switched" | "detached" = "deleted";
+    try {
+      await this.vault.change(async state => {
+        beforeCredential = this.pi.getCredential(provider);
+        beforeModel = this.pi.getModel();
+        const scoped = state.providers[provider];
+        const profile = scoped?.profiles[name];
+        if (!profile) throw new Error("Profile not found");
+        const active = sameCredential(this.pi.getCredential(provider), profile.credential);
+        const replacement = Object.keys(scoped.profiles).find(candidate => candidate !== name);
+        if (active && replacement) {
+          const model = scoped.model && this.pi.models(provider).includes(scoped.model) ? scoped.model : this.pi.models(provider)[0];
+          if (!model) throw new Error("No compatible model is available");
+          const nextProfile = scoped.profiles[replacement];
+          if (!nextProfile) throw new Error("Replacement profile not found");
+          this.pi.setCredential(provider, nextProfile.credential);
+          if (!await this.pi.setModel(model)) throw new Error("model selection failed");
+          scoped.defaultProfile = replacement;
+          result = "switched";
+        } else if (active) {
+          this.pi.removeCredential(provider);
+          result = "detached";
+        }
+        delete scoped.profiles[name];
+        if (!Object.keys(scoped.profiles).length) delete state.providers[provider];
+      });
+      return result;
+    } catch {
+      beforeCredential ? this.pi.setCredential(provider, beforeCredential) : this.pi.removeCredential(provider);
+      if (beforeModel) await this.pi.setModel(beforeModel);
+      throw new Error("Deletion failed; the previous selection was restored");
+    }
   }
 
   async reconcile(provider: string, action: "update" | "create" | "restore", name?: string): Promise<void> {
@@ -146,29 +159,22 @@ export class ProfileManager {
   }
 
   private async refresh(provider: OAuthProviderInterface, profile: CredentialProfile): Promise<void> {
-    let previous: OAuthCredential | undefined;
-    let refreshed: OAuthCredential | undefined;
-    await this.vault.change(async state => {
-      const current = Object.values(state.providers[provider.id]?.profiles ?? {}).find(value => value.id === profile.id);
-      if (!current) return;
-      previous = structuredClone(current.credential);
-      try {
-        refreshed = oauth(await provider.refreshToken(current.credential));
-        current.credential = refreshed;
-        current.generation++;
-        current.status = "ready";
-        current.retryCount = 0;
-        delete current.nextRetryAt;
-      } catch (error) {
+    try {
+      const refreshed = oauth(await provider.refreshToken(profile.credential));
+      const committed = await this.vault.commitRefresh(provider.id, profile.id, profile.generation, refreshed);
+      if (committed && sameCredential(this.pi.getCredential(provider.id), profile.credential)) this.pi.setCredential(provider.id, refreshed);
+    } catch (error) {
+      await this.vault.change(state => {
+        const current = Object.values(state.providers[provider.id]?.profiles ?? {}).find(value => value.id === profile.id);
+        if (!current || current.generation !== profile.generation) return;
         if (isPermanent(error)) current.status = "needs-login";
         else {
           current.status = "retrying";
           current.retryCount = Math.min(current.retryCount + 1, 3);
           current.nextRetryAt = this.now() + ([30_000, 120_000, 600_000][current.retryCount - 1] ?? 600_000);
         }
-      }
-    });
-    if (refreshed && sameCredential(this.pi.getCredential(provider.id), previous)) this.pi.setCredential(provider.id, refreshed);
+      });
+    }
   }
 
   private requireProvider(provider: string): void {

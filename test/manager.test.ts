@@ -76,6 +76,47 @@ test("rename, deletion, and reconciliation preserve explicit outcomes", async ()
   assert.equal(env.mirror.get("anthropic")?.access, "new");
 });
 
+test("delete and Activation are serialized across managers", async () => {
+  const env = await manager();
+  await env.manager.capture("anthropic", credential("one"), "One");
+  await env.manager.capture("anthropic", credential("work"), "Work");
+  await env.manager.activate("anthropic", "Work", "anthropic/new");
+  let release!: () => void;
+  let entered!: () => void;
+  const paused = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const setModel = env.adapter.setModel;
+  let pauseOnce = true;
+  env.adapter.setModel = async value => {
+    if (pauseOnce) { pauseOnce = false; entered(); await paused; }
+    return setModel(value);
+  };
+  const deletion = env.manager.delete("anthropic", "Work");
+  await started;
+  const competing = env.manager.activate("anthropic", "Work", "anthropic/new");
+  release();
+  assert.equal(await deletion, "switched");
+  await assert.rejects(competing, /previous selection was restored/);
+  assert.equal(env.mirror.get("anthropic")?.access, "one");
+});
+
+test("rejects a stale refresh result", async () => {
+  const env = await manager();
+  const profileName = await env.manager.capture("anthropic", credential("old", 0), "Work");
+  let resolveRefresh!: (value: OAuthCredentials) => void;
+  let started!: () => void;
+  const refreshStarted = new Promise<void>(resolve => { started = resolve; });
+  env.provider.refreshToken = async () => new Promise(resolve => { resolveRefresh = resolve; started(); });
+  const refreshing = env.manager.refreshAll();
+  await refreshStarted;
+  const profile = (await env.manager.state()).providers.anthropic?.profiles[profileName];
+  assert.ok(profile);
+  await env.manager.vault.updateCredential("anthropic", profile.id, { type: "oauth", ...credential("new") });
+  resolveRefresh(credential("stale"));
+  await refreshing;
+  assert.equal((await env.manager.state()).providers.anthropic?.profiles.Work?.credential.access, "new");
+});
+
 test("refresh retains rotation and marks permanent failures without deletion", async () => {
   const env = await manager();
   await env.manager.capture("anthropic", credential("saved", 0), "Work");
