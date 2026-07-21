@@ -13,9 +13,10 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.6",
-    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
     "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
   },
@@ -23,5 +24,8 @@
     "extensions": ["./src/index.ts"]
   },
   "files": ["src", "README.md", "docs/usage.md"],
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  }
 }

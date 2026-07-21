@@ -3,11 +3,8 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type {
-	OAuthCredentials,
-	OAuthProviderInterface,
-} from "@earendil-works/pi-ai/compat";
-import { ProfileManager } from "../src/manager.js";
+import type { OAuthCredentials } from "@earendil-works/pi-ai";
+import { ProfileManager, type OAuthProviderInterface } from "../src/manager.js";
 import { Vault } from "../src/vault.js";
 
 const credential = (

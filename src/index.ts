@@ -5,24 +5,32 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { OAuthProviderInterface } from "@earendil-works/pi-ai/compat";
-import { ProfileManager, type PiAdapter } from "./manager.js";
+import type {
+	Api,
+	Model,
+	OAuthAuth,
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+	Provider,
+} from "@earendil-works/pi-ai";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { AuthMirror } from "./auth-mirror.js";
+import {
+	ProfileManager,
+	type OAuthProviderInterface,
+	type PiAdapter,
+} from "./manager.js";
 import { profileUsageRows } from "./usage.js";
 import { Vault } from "./vault.js";
 
 const ALLOWLIST = new Set(["anthropic", "github-copilot", "openai-codex"]);
-const ORIGINAL_PROVIDER = Symbol.for("pi-auth.original-oauth-provider");
-type WrappedProvider = Omit<OAuthProviderInterface, "id"> & {
-	[ORIGINAL_PROVIDER]: OAuthProviderInterface;
-};
-const unwrapProvider = (provider: OAuthProviderInterface) =>
-	(provider as OAuthProviderInterface & Partial<WrappedProvider>)[
-		ORIGINAL_PROVIDER
-	] ?? provider;
 const displayError =
 	"Profile operation failed; saved credentials were not changed";
 
-export default function piAuth(pi: ExtensionAPI) {
+export default function piAuth(
+	pi: ExtensionAPI,
+	catalog: Provider[] = builtinProviders(),
+) {
 	let manager: ProfileManager | undefined;
 	let selectedModel: string | undefined;
 	let statusTimer: NodeJS.Timeout | undefined;
@@ -41,24 +49,20 @@ export default function piAuth(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		selectedModel = ctx.model && `${ctx.model.provider}/${ctx.model.id}`;
-		const oauthProviders = ctx.modelRegistry.authStorage
-			.getOAuthProviders()
-			.map(unwrapProvider);
-		const originals = oauthProviders.filter((provider) =>
-			ALLOWLIST.has(provider.id),
-		);
+		const originals = catalog.flatMap((provider) => {
+			const legacy = ALLOWLIST.has(provider.id)
+				? legacyProvider(provider)
+				: undefined;
+			return legacy ? [legacy] : [];
+		});
+		const mirror = new AuthMirror(join(getAgentDir(), "auth.json"));
 		const providers = new Map(
 			originals.map((provider) => [provider.id, provider]),
 		);
 		const adapter: PiAdapter = {
-			getCredential: (provider) => {
-				const value = ctx.modelRegistry.authStorage.get(provider);
-				return value?.type === "oauth" ? value : undefined;
-			},
-			setCredential: (provider, credential) =>
-				ctx.modelRegistry.authStorage.set(provider, credential),
-			removeCredential: (provider) =>
-				ctx.modelRegistry.authStorage.remove(provider),
+			getCredential: (provider) => mirror.get(provider),
+			setCredential: (provider, credential) => mirror.set(provider, credential),
+			removeCredential: (provider) => mirror.remove(provider),
 			getModel: () => selectedModel,
 			setModel: async (value) => {
 				const separator = value.indexOf("/");
@@ -90,13 +94,6 @@ export default function piAuth(pi: ExtensionAPI) {
 					return manager;
 				}),
 			});
-		for (const provider of oauthProviders.filter(
-			(value) => !ALLOWLIST.has(value.id),
-		)) {
-			pi.registerProvider(provider.id, {
-				oauth: rejectUnsupportedProvider(provider),
-			});
-		}
 		await manager.bootstrap();
 		await updateStatus(ctx);
 		statusTimer = setInterval(() => void updateStatus(ctx), 2_000);
@@ -155,38 +152,86 @@ export default function piAuth(pi: ExtensionAPI) {
 	});
 }
 
-function rejectUnsupportedProvider(
-	provider: OAuthProviderInterface,
-): WrappedProvider {
+function legacyProvider(
+	provider: Provider,
+): OAuthProviderInterface | undefined {
+	const oauth = provider.auth.oauth;
+	if (!oauth) return undefined;
 	return {
-		[ORIGINAL_PROVIDER]: provider,
-		name: provider.name,
-		...(provider.usesCallbackServer !== undefined && {
-			usesCallbackServer: provider.usesCallbackServer,
+		id: provider.id,
+		name: oauth.name,
+		login: (callbacks) =>
+			oauth.login(modernCallbacks(callbacks)).then(withoutType),
+		refreshToken: (credential) =>
+			oauth.refresh({ ...credential, type: "oauth" }).then(withoutType),
+		getApiKey: (credential) => credential.access,
+		...(provider.id === "github-copilot" && {
+			modifyModels: (models: Model<Api>[], credential: OAuthCredentials) =>
+				models.map((model) => ({
+					...model,
+					baseUrl: copilotBaseUrl(credential),
+				})),
 		}),
-		refreshToken: (credential) => provider.refreshToken(credential),
-		getApiKey: (credential) => provider.getApiKey(credential),
-		...(provider.modifyModels && {
-			modifyModels: provider.modifyModels.bind(provider),
-		}),
-		login: async () => {
-			throw new Error(
-				`pi-auth does not support OAuth login for ${provider.id}`,
-			);
+	};
+}
+
+function modernCallbacks(
+	callbacks: OAuthLoginCallbacks,
+): Parameters<OAuthAuth["login"]>[0] {
+	return {
+		...(callbacks.signal && { signal: callbacks.signal }),
+		notify: (event) => {
+			if (event.type === "auth_url") callbacks.onAuth(event);
+			else if (event.type === "device_code") callbacks.onDeviceCode(event);
+			else callbacks.onProgress?.(event.message);
+		},
+		prompt: (prompt) => {
+			if (prompt.type === "select")
+				return callbacks
+					.onSelect({ message: prompt.message, options: [...prompt.options] })
+					.then((value) => value ?? "");
+			if (prompt.type === "manual_code" && callbacks.onManualCodeInput)
+				return callbacks.onManualCodeInput();
+			return callbacks.onPrompt({
+				message: prompt.message,
+				...(prompt.placeholder && { placeholder: prompt.placeholder }),
+			});
 		},
 	};
+}
+
+function withoutType(
+	credential: Awaited<ReturnType<OAuthAuth["login"]>>,
+): OAuthCredentials {
+	const { type: _type, ...value } = credential;
+	return value;
+}
+
+function copilotBaseUrl(credential: OAuthCredentials): string {
+	const proxy = credential.access.match(/proxy-ep=([^;]+)/)?.[1];
+	if (proxy) return `https://${proxy.replace(/^proxy\./, "api.")}`;
+	const enterpriseUrl = credential.enterpriseUrl;
+	if (typeof enterpriseUrl === "string" && enterpriseUrl) {
+		try {
+			const domain = new URL(
+				enterpriseUrl.includes("://")
+					? enterpriseUrl
+					: `https://${enterpriseUrl}`,
+			).hostname;
+			return `https://copilot-api.${domain}`;
+		} catch {
+			/* Fall through to the public endpoint. */
+		}
+	}
+	return "https://api.individual.githubcopilot.com";
 }
 
 function wrapProvider(
 	provider: OAuthProviderInterface,
 	current: () => ProfileManager,
-): WrappedProvider {
+): Omit<OAuthProviderInterface, "id"> {
 	return {
-		[ORIGINAL_PROVIDER]: provider,
 		name: provider.name,
-		...(provider.usesCallbackServer !== undefined && {
-			usesCallbackServer: provider.usesCallbackServer,
-		}),
 		refreshToken: (credential) => provider.refreshToken(credential),
 		getApiKey: (credential) => provider.getApiKey(credential),
 		...(provider.modifyModels && {

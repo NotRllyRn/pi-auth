@@ -1,13 +1,28 @@
 import type {
+	Api,
+	Model,
 	OAuthCredentials,
-	OAuthProviderInterface,
-} from "@earendil-works/pi-ai/compat";
+	OAuthLoginCallbacks,
+} from "@earendil-works/pi-ai";
 import type {
 	CredentialProfile,
 	OAuthCredential,
 	VaultState,
 } from "./types.js";
 import type { Vault } from "./vault.js";
+
+/** Legacy extension OAuth shape used by Pi's provider registration API. */
+export interface OAuthProviderInterface {
+	id: string;
+	name: string;
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+	getApiKey(credentials: OAuthCredentials): string;
+	modifyModels?(
+		models: Model<Api>[],
+		credentials: OAuthCredentials,
+	): Model<Api>[];
+}
 
 export interface PiAdapter {
 	getCredential(provider: string): OAuthCredential | undefined;
